@@ -12,6 +12,11 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+func init() {
+	gob.Register(map[string]interface{}{})
+	gob.Register([]interface{}{})
+}
+
 // CacheItem represents a single cache item with a value and an expiration time.
 type CacheItem[T any] struct {
 	Value      T
@@ -48,6 +53,10 @@ func New[T any](cfg *Config) (*Cache[T], error) {
 		flushToFile: cfg.File,
 		cfg:         cfg,
 	}
+
+	gob.Register(map[string]CacheItem[T]{})
+	gob.Register(CacheItem[T]{})
+	gob.Register([]T{})
 
 	if cfg.File != "" {
 		if err := c.loadFromFile(); err != nil {
