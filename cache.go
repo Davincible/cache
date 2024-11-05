@@ -1,21 +1,18 @@
 package cache
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
-
-func init() {
-	gob.Register(map[string]interface{}{})
-	gob.Register([]interface{}{})
-}
 
 // CacheItem represents a single cache item with a value and an expiration time.
 type CacheItem[T any] struct {
@@ -27,6 +24,7 @@ type CacheItem[T any] struct {
 type Cache[T any] struct {
 	items       map[string]CacheItem[T]
 	mu          sync.RWMutex
+	fileMu      sync.Mutex
 	defaultTTL  time.Duration
 	flushToFile string
 
@@ -54,10 +52,6 @@ func New[T any](cfg *Config) (*Cache[T], error) {
 		cfg:         cfg,
 	}
 
-	gob.Register(map[string]CacheItem[T]{})
-	gob.Register(CacheItem[T]{})
-	gob.Register([]T{})
-
 	if cfg.File != "" {
 		if err := c.loadFromFile(); err != nil {
 			return nil, fmt.Errorf("error loading cache from file: %w", err)
@@ -80,7 +74,11 @@ func (c *Cache[T]) Close() error {
 }
 
 func (c *Cache[T]) setupNATS() error {
-	nc, err := nats.Connect(c.cfg.NATSURL)
+	nc, err := nats.Connect(c.cfg.NATSURL,
+		nats.Timeout(5*time.Second),
+		nats.PingInterval(time.Second),
+		nats.MaxPingsOutstanding(3),
+	)
 	if err != nil {
 		return fmt.Errorf("error connecting to NATS: %w", err)
 	}
@@ -137,7 +135,10 @@ func (c *Cache[T]) flushToFileFunc(noLock ...bool) error {
 		return nil
 	}
 
-	if len(noLock) == 0 {
+	c.fileMu.Lock()
+	defer c.fileMu.Unlock()
+
+	if len(noLock) == 0 || !noLock[0] {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 	}
@@ -146,14 +147,36 @@ func (c *Cache[T]) flushToFileFunc(noLock ...bool) error {
 		fmt.Printf("Flushing %d items to %s\n", len(c.items), c.flushToFile)
 	}
 
-	file, err := os.Create(c.flushToFile)
-	if err != nil {
-		return fmt.Errorf("flushing to cache: %w", err)
+	// First check if directory exists, if not create it
+	dir := filepath.Dir(c.flushToFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating directory structure: %w", err)
 	}
-	defer file.Close()
 
-	if err := gob.NewEncoder(file).Encode(c.items); err != nil {
+	// Open file with proper flags
+	file, err := os.OpenFile(c.flushToFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("opening cache file: %w", err)
+	}
+
+	// Create a buffered writer
+	bufferedWriter := bufio.NewWriter(file)
+
+	// Encode data
+	if err := gob.NewEncoder(bufferedWriter).Encode(c.items); err != nil {
+		file.Close()
 		return fmt.Errorf("encoding to gob: %w", err)
+	}
+
+	// Explicitly flush the buffer before closing
+	if err := bufferedWriter.Flush(); err != nil {
+		file.Close()
+		return fmt.Errorf("flushing buffer: %w", err)
+	}
+
+	// Close the file
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing file: %w", err)
 	}
 
 	return nil
@@ -171,7 +194,7 @@ func (c *Cache[T]) syncWithNATS(key string, item CacheItem[T]) error {
 	}
 
 	if _, err := c.natsKV.Put(key, buf.Bytes()); err != nil {
-		return fmt.Errorf("putting to NATS KV: %w", err)
+		return fmt.Errorf("putting to NATS KV (key: '%s'): %w", key, err)
 	}
 
 	return nil
@@ -195,6 +218,30 @@ func (c *Cache[T]) Set(key string, value T, ttl ...time.Duration) error {
 	}
 
 	item := CacheItem[T]{Value: value, Expiration: expirationTime}
+	c.items[key] = item
+
+	if err := c.syncWithNATS(key, item); err != nil {
+		return fmt.Errorf("error syncing with NATS: %w", err)
+	}
+
+	if c.cfg.FlushImmediately {
+		return c.flushToFileFunc(true)
+	}
+
+	return nil
+}
+
+// Edit updates an item in the cache, takes a function that modifies the item.
+func (c *Cache[T]) Edit(key string, editFunc func(T) T) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	item, found := c.items[key]
+	if !found {
+		return fmt.Errorf("key '%s' not found", key)
+	}
+
+	item.Value = editFunc(item.Value)
 	c.items[key] = item
 
 	if err := c.syncWithNATS(key, item); err != nil {
